@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hoax News Detector</title>
+  <meta name="theme-color" content="#0d6efd" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Navbar -->
+  <header class="navbar" role="banner">
+    <nav class="nav-inner" aria-label="Primary">
+      <div class="brand">
+        <span class="brand-dot" aria-hidden="true"></span>
+        <span class="brand-text">Hoax News Detector</span>
+      </div>
+    </nav>
+  </header>
+
+  <main class="page">
+    <section class="card container" aria-labelledby="title">
+      <h1 id="title">Cek Berita-mu di Sini!</h1>
+      <p class="subtitle">
+        Tempel URL berita/artikel, lalu tekan <strong>Check</strong> untuk mendeteksi apakah berpotensi hoaks atau tidak.
+      </p>
+
+      <form id="predictForm" class="form" novalidate>
+        <label class="sr-only" for="newsUrl">URL Berita</label>
+        <input
+          type="url"
+          id="newsUrl"
+          name="url"
+          placeholder="Tempel URL, misal: https://contohmedia.com/berita/123"
+          required
+          inputmode="url"
+          autocomplete="url"
+        />
+        <button type="submit" aria-label="Cek berita">Check</button>
+      </form>
+
+      <div id="result" class="hidden result" role="status" aria-live="polite"></div>
+
+      <!-- Note / Cara Pakai -->
+      <section id="how-to" class="note" aria-labelledby="howto-heading">
+        <h2 id="howto-heading">Cara Menggunakan</h2>
+        <ol>
+          <li>Salin tautan (URL) berita atau artikel dari situs berita.</li>
+          <li>Tempel URL di kolom di atas lalu klik <em>Check</em>.</li>
+          <li>Tunggu sebentar hingga hasil muncul di bawah form.</li>
+        </ol>
+        <div class="tips">
+          <strong>Penting:</strong>
+          <ul>
+            <li>Gunakan URL artikel lengkap (bukan homepage).</li>
+          </ul>
+        </div>
+        <details class="examples">
+          <summary>Contoh URL yang valid</summary>
+          <ul>
+            <li>https://example.com/news/kebijakan-baru-2025</li>
+            <li>https://portal.id/artikel/teknologi/ai-dalam-pendidikan</li>
+          </ul>
+        </details>
+      </section>
+    </section>
+
+    <footer class="footer">
+      <p>© <span id="year"></span> Hoax News Detector • Kelompok 3</p>
+    </footer>
+  </main>
+
+  <script>
+    // Tahun dinamis untuk footer (opsional, tidak mengganggu script.js kamu)
+    document.getElementById('year').textContent = new Date().getFullYear();
+  </script>
+  <script src="script.js"></script>
+</body>
+</html>
