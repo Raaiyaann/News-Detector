@@ -23,63 +23,81 @@ function setBusy(formEl, busy) {
   btn.textContent = busy ? "Memeriksa…" : "Check";
 }
 
-function classifyBadge(prediction) {
-  const label = String(prediction).toLowerCase();
-  const hoaxy = /(hoax|fake|disinfo|misinfo|false|spam|\b1\b)/i.test(label);
-  return hoaxy ? "result-true" : "result-false";
-}
-
 function fmtPct(x) {
   if (typeof x !== "number" || Number.isNaN(x)) return "—";
   return (x * 100).toFixed(1) + "%";
 }
 
+function renderError(msg) {
+  const result = $("#result");
+  result.className = "result result-true"; // merah untuk error
+  result.innerHTML = `❌ ${msg || "Terjadi kesalahan koneksi ke server."}`;
+}
+
+// ===== RENDER =====
 function renderResult(data) {
   const result = $("#result");
-  result.className = "result"; // reset
-  result.innerHTML = "";
+  result.className = "result";
 
-  if (!data || !data.prediction) {
+  if (!data) {
     result.innerHTML = "❓ Tidak bisa menentukan hasil. Coba lagi.";
     return;
   }
 
-  const badgeClass = classifyBadge(data.prediction);
-  result.classList.add(badgeClass);
+  const isHoax = !!data.is_hoax;
 
-  const source = data.source ? `<span class="badge">${data.source}</span>` : "";
+  // Ambil prob hoaks dari backend jika ada
+  const hoaxProb = (typeof data.hoax_probability === "number") ? data.hoax_probability : null;
+
+  // >>> Ini yang dibetulkan:
+  // Jika verdict hoaks → confidence = hoaxProb
+  // Jika verdict kredibel → confidence = 1 - hoaxProb
+  // Fallback ke data.confidence bila hoaxProb tak tersedia
+  let displayConfidence = null;
+  if (hoaxProb != null) {
+    displayConfidence = isHoax ? hoaxProb : (1 - hoaxProb);
+  } else if (typeof data.confidence === "number") {
+    displayConfidence = data.confidence; // prob untuk label terpilih
+  }
+
+  result.classList.add(isHoax ? "result-true" : "result-false");
+
+  const header =
+    (isHoax ? `⚠️ <strong>Berpotensi HOAKS</strong>` : `✅ <strong>Tampak Kredibel</strong>`) +
+    (displayConfidence != null ? ` • Keyakinan model: ${(displayConfidence * 100).toFixed(1)}%` : "");
+
   const title = data.title ? `<div style="font-weight:700;margin:.25rem 0;">${data.title}</div>` : "";
-  const conf = data.confidence != null ? fmtPct(data.confidence) : null;
+  const meta =
+    `<div style="margin-top:.5rem;font-weight:500;color:#374151;display:flex;gap:.35rem;flex-wrap:wrap;">
+       ${data.source ? `<span class="badge">${data.source}</span>` : ""}
+       ${data.published ? `<span class="badge">${new Date(data.published).toLocaleString()}</span>` : ""}
+       ${data.words ? `<span class="badge">${data.words} kata</span>` : ""}
+     </div>`;
 
-  const extra = `
-    <div style="margin-top:.5rem;font-weight:500;color:#374151">
-      ${source}
-      ${data.fetched_at ? `<span class="badge" style="margin-left:.35rem;">${new Date(data.fetched_at).toLocaleString()}</span>` : ""}
-      ${data.words ? `<span class="badge" style="margin-left:.35rem;">${data.words} kata</span>` : ""}
-    </div>
-    ${data.excerpt ? `<details style="margin-top:.5rem;"><summary>Lihat ringkasan konten</summary><p style="margin:.5rem 0 0;">${data.excerpt}</p></details>` : ""}
-    ${data.probabilities ? `
-      <details style="margin-top:.5rem;">
-        <summary>Probabilitas per kelas</summary>
-        <div style="margin-top:.4rem;font-size:.95rem;">
-          ${Object.entries(data.probabilities).map(([k,v]) => `<div style="display:flex;justify-content:space-between;"><span>${k}</span><strong>${fmtPct(v)}</strong></div>`).join("")}
-        </div>
-      </details>` : ""}
-  `;
+  const excerpt = data.excerpt
+    ? `<details style="margin-top:.5rem;">
+         <summary>Lihat ringkasan konten</summary>
+         <p style="margin:.5rem 0 0;">${data.excerpt}</p>
+       </details>` : "";
 
-  result.innerHTML =
-    (badgeClass === "result-true"
-      ? `⚠️ <strong>Berpotensi HOAKS</strong>${conf ? ` • Keyakinan model: ${conf}` : ""}`
-      : `✅ <strong>Tampak Kredibel</strong>${conf ? ` • Keyakinan model: ${conf}` : ""}`) +
-    title +
-    extra;
+  let probs = "";
+  if (data.probabilities) {
+    const rows = Object.entries(data.probabilities)
+      .sort((a,b) => String(a[0]).localeCompare(String(b[0])))
+      .map(([k,v]) => `<div style="display:flex;justify-content:space-between;">
+                         <span>${k}</span><strong>${(v*100).toFixed(1)}%</strong>
+                       </div>`).join("");
+    probs = `<details style="margin-top:.5rem;">
+               <summary>Probabilitas per kelas</summary>
+               <div style="margin-top:.4rem;font-size:.95rem;">${rows}</div>
+             </details>`;
+  }
+
+  const note = data.note ? `<div class="tips" style="margin-top:.6rem;">${data.note}</div>` : "";
+
+  result.innerHTML = `${header}${title}${meta}${excerpt}${probs}${note}`;
 }
 
-function renderError(msg) {
-  const result = $("#result");
-  result.className = "result";
-  result.innerHTML = `❌ ${msg || "Terjadi kesalahan koneksi ke server."}`;
-}
 
 // ===== RESTORE LAST RESULT (opsional) =====
 document.addEventListener("DOMContentLoaded", () => {
@@ -106,9 +124,9 @@ $("#predictForm").addEventListener("submit", async (e) => {
     return;
   }
 
-  // Abort after 30s
+  // Abort after 120s (unduhan model pertama kali bisa lama)
   const controller = new AbortController();
-  const to = setTimeout(() => controller.abort("timeout"), 30000);
+  const to = setTimeout(() => controller.abort("timeout"), 120000);
 
   try {
     setBusy(form, true);
@@ -122,12 +140,17 @@ $("#predictForm").addEventListener("submit", async (e) => {
 
     clearTimeout(to);
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
       throw new Error(text || `HTTP ${res.status}`);
     }
 
-    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
 
     // Simpan untuk restore
     sessionStorage.setItem("lastResult", JSON.stringify(data));

@@ -40,8 +40,19 @@ MAX_CHARS = int(os.getenv("MAX_CHARS", "200000"))
 
 # -- Konfigurasi EMBEDDING BERT (cocokkan dgn Colab) --
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "indobenchmark/indobert-base-p1")
-EMBED_MAX_LENGTH = int(os.getenv("EMBED_MAX_LENGTH", "512"))   # sama seperti Colab
-EMBED_CHUNK_TOKENS = int(os.getenv("EMBED_CHUNK_TOKENS", "512"))  # potong teks panjang per 512 token dan rata-rata
+EMBED_MAX_LENGTH = int(os.getenv("EMBED_MAX_LENGTH", "512"))
+EMBED_CHUNK_TOKENS = int(os.getenv("EMBED_CHUNK_TOKENS", "512"))
+
+# --- Konfigurasi HOAX & Safety ---
+HOAX_LABELS = set(x.strip().lower() for x in os.getenv("HOAX_LABELS", "0,hoax,fake").split(","))
+HOAX_THRESHOLD = float(os.getenv("HOAX_THRESHOLD", "0.6"))
+TRUSTED_DOMAINS = set(
+    x.strip().lower()
+    for x in os.getenv(
+        "TRUSTED_DOMAINS",
+        "cnnindonesia.com,kompas.com,detik.com,tempo.co,antaranews.com,bbc.com,cnn.com"
+    ).split(",")
+)
 
 # ---------- App ----------
 app = Flask(__name__)
@@ -134,8 +145,30 @@ def normalize_text(s: str) -> str:
             pass
     return s
 
-def guess_is_hoax(label) -> bool:
-    return str(label).strip().lower() in {"hoax","fake","disinfo","misinfo","1","false","spam","neg","negative"}
+# --- Penentuan hoaks yang bisa dikonfigurasi ---
+def decide_hoax(pred_label, classes=None, proba=None):
+    """
+    Mengembalikan (is_hoax: bool, hoax_prob: Optional[float]).
+    - is_hoax True jika label prediksi termasuk HOAX_LABELS & (prob hoaks >= HOAX_THRESHOLD jika tersedia),
+      atau jika ada kelas hoaks di classes dengan probabilitas >= HOAX_THRESHOLD.
+    """
+    pl = str(pred_label).strip().lower()
+    hoax_prob = None
+    if classes is not None and proba is not None:
+        for k, p in zip(classes, proba):
+            if str(k).strip().lower() in HOAX_LABELS:
+                hoax_prob = float(p)
+                break
+
+    if pl in HOAX_LABELS:
+        if hoax_prob is not None:
+            return (hoax_prob >= HOAX_THRESHOLD), hoax_prob
+        return True, None
+
+    if hoax_prob is not None:
+        return (hoax_prob >= HOAX_THRESHOLD), hoax_prob
+
+    return False, None
 
 # ---------- Model & embedding loader ----------
 class Predictor:
@@ -171,7 +204,7 @@ class Predictor:
             "Sediakan VECTOR_PATH (TF-IDF) atau aktifkan EMBED_MODEL_NAME (transformers+torch)."
         )
 
-# -- Embedding IndoBERT seperti di Colab (mean last_hidden_state) --
+# -- Embedding IndoBERT (mean last_hidden_state) --
 _tokenizer = None
 _model = None
 _device = None
@@ -180,33 +213,35 @@ def _init_embedder():
     global _tokenizer, _model, _device
     if _tokenizer is not None and _model is not None:
         return
-    # import lokal agar waktu start cepat jika tidak dipakai
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # opsional: hilangkan warning symlink di Windows
+
     import torch
     from transformers import AutoTokenizer, AutoModel
 
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
-    _model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to(_device)
+    _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME, use_fast=True)
+    try:
+        _model = AutoModel.from_pretrained(EMBED_MODEL_NAME, use_safetensors=True).to(_device)
+    except Exception as e:
+        raise RuntimeError(
+            "Gagal memuat model dengan safetensors. Pastikan paket 'safetensors' terpasang "
+            "atau upgrade torch >= 2.6. Detail: " + str(e)
+        )
     _model.eval()
 
 def embed_text_mean_last_hidden_state(text: str):
-    """Kembalikan vektor (1, D) sesuai teknik di notebook: mean(last_hidden_state)."""
     import numpy as np
     import torch
-
     _init_embedder()
-    # Tokenisasi; untuk teks panjang, potong per EMBED_CHUNK_TOKENS lalu rata-rata
-    # Strategi sederhana: bagi per kalimat panjang (garansi: truncation True)
-    # Di sini kita split berdasar panjang kata biar murah
+
     words = text.split()
     if not words:
         return np.zeros((1, _model.config.hidden_size), dtype=np.float32)
 
     chunks = []
-    step = 4000  # pendekatan kasar; nanti di-tokenizer tetap truncation 512
+    step = 4000  # potongan kata (tokenizer tetap truncation 512)
     for i in range(0, len(words), step):
-        chunk = " ".join(words[i:i+step])
-        chunks.append(chunk)
+        chunks.append(" ".join(words[i:i+step]))
 
     embs = []
     with torch.no_grad():
@@ -220,13 +255,13 @@ def embed_text_mean_last_hidden_state(text: str):
             )
             inputs = {k: v.to(_model.device) for k, v in inputs.items()}
             outputs = _model(**inputs)
-            # mean pooling seperti di Colab
             emb = outputs.last_hidden_state.mean(dim=1).cpu().numpy()  # (1, hidden)
             embs.append(emb)
 
-    arr = np.vstack(embs)  # (num_chunks, hidden)
-    arr = arr.mean(axis=0, keepdims=True)  # (1, hidden)
-    return arr.astype("float32")
+    import numpy as np
+    arr = np.vstack(embs)             # (n, hidden)
+    arr = arr.mean(axis=0, keepdims=True).astype("float32")  # (1, hidden)
+    return arr
 
 def load_predictor():
     obj = joblib.load(MODEL_PATH)
@@ -234,7 +269,6 @@ def load_predictor():
     # 1) Pipeline?
     if Pipeline is not None and isinstance(obj, Pipeline):
         return Predictor(obj, is_pipeline=True)
-
     if hasattr(obj, "named_steps"):
         return Predictor(obj, is_pipeline=True)
 
@@ -254,7 +288,6 @@ def load_predictor():
 
     # 3) Hanya classifier → coba TF-IDF; kalau tidak ada, pakai EMBEDDING BERT
     model_obj = obj
-
     vectorizer = None
     if os.path.exists(VECTOR_PATH):
         try:
@@ -265,7 +298,6 @@ def load_predictor():
     if vectorizer is not None:
         return Predictor(model_obj, vectorizer=vectorizer, is_pipeline=False)
 
-    # Tidak ada vectorizer → siapkan embedder IndoBERT seperti Colab
     return Predictor(model_obj, vectorizer=None, is_pipeline=False, embedder=embed_text_mean_last_hidden_state)
 
 # Muat predictor saat start
@@ -281,6 +313,8 @@ def health():
         "has_vectorizer": predictor.vectorizer is not None,
         "uses_bert_embedder": predictor.embedder is not None,
         "embed_model": EMBED_MODEL_NAME if predictor.embedder else None,
+        "hoax_labels": sorted(list(HOAX_LABELS)),
+        "hoax_threshold": HOAX_THRESHOLD,
     }
     return jsonify(info)
 
@@ -309,11 +343,14 @@ def predict():
         y_pred, proba, classes = predictor.predict(clean_text)
         pred_label = str(y_pred)
 
+        # pastikan classes tersedia jika ada
+        if classes is None and hasattr(predictor.model_obj, "classes_"):
+            classes = predictor.model_obj.classes_
+
+        # probabilitas & confidence
         probabilities = None
         confidence = None
         if proba is not None:
-            if classes is None and hasattr(predictor.model_obj, "classes_"):
-                classes = predictor.model_obj.classes_
             if classes is not None:
                 probabilities = {str(c): float(p) for c, p in zip(classes, proba)}
                 try:
@@ -325,20 +362,35 @@ def predict():
                 probabilities = {str(i): float(p) for i, p in enumerate(proba)}
                 confidence = float(max(proba))
 
+        # keputusan hoaks berbasis mapping + threshold
+        is_hoax, hoax_prob = decide_hoax(pred_label, classes=classes, proba=proba)
+
+        # safety net untuk domain tepercaya
+        domain = urlparse(url).netloc.lower()
+        safety_note = None
+        if domain in TRUSTED_DOMAINS and is_hoax:
+            if hoax_prob is None or hoax_prob < 0.90:
+                is_hoax = False
+                safety_note = f"Diturunkan karena domain tepercaya ({domain}) dan probabilitas hoaks < 0.90"
+
         payload = {
             "prediction": pred_label,
-            "is_hoax": guess_is_hoax(pred_label),
-            "confidence": confidence,
+            "is_hoax": is_hoax,
+            "hoax_probability": hoax_prob,
+            "hoax_threshold": HOAX_THRESHOLD,
             "probabilities": probabilities,
+            "classes": [str(c) for c in classes] if classes is not None else None,
+            "confidence": confidence,  # prob. untuk label yang diprediksi
             "title": title,
             "published": published,
-            "source": urlparse(url).netloc,
+            "source": domain,
             "url": url,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "words": len(raw_text.split()),
             "excerpt": raw_text[:600].strip() + ("…" if len(raw_text) > 600 else ""),
             "preprocessed_words": len(clean_text.split()),
             "latency_ms": int((time.time() - t0) * 1000),
+            "note": safety_note,
         }
         return jsonify(payload)
 
