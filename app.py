@@ -54,6 +54,24 @@ TRUSTED_DOMAINS = set(
     ).split(",")
 )
 
+# --- Fact-check override policy ---
+# "article" (default) => nilai artikelnya (cek-fakta dianggap kredibel)
+# "claim"             => nilai klaimnya (jika verdict hoax/keliru/salah => is_hoax=True)
+FACTCHECK_POLICY = os.getenv("FACTCHECK_POLICY", "article").strip().lower()
+FACTCHECK_DOMAINS = set(x.strip().lower() for x in os.getenv(
+    "FACTCHECK_DOMAINS",
+    "turnbackhoax.id,cekfakta.tempo.co,cekfakta.kompas.com,kominfo.go.id"
+).split(","))
+
+# kata kunci verdict pada halaman cek-fakta
+FC_HOAX_PAT = re.compile(
+    r'\b(hoaks?|keliru|salah|penipuan|disinformasi|misinformasi|impostor\s+content|fabricated|altered|false|tidak\s*benar)\b',
+    re.I
+)
+FC_NOT_HOAX_PAT = re.compile(
+    r'\b(bukan\s+hoaks?|klarifikasi:\s*benar|fakta|true|tepat|sesuai)\b', re.I
+)
+
 # ---------- App ----------
 app = Flask(__name__)
 CORS(app)
@@ -102,6 +120,64 @@ def _fallback_meta_from_html(html_str: str):
     published = d.group(1).strip() if d else None
     return title, published
 
+# ====== Hapus label debunk di judul/teks (mis. [PENIPUAN], [HOAKS], dll) ======
+DEBUNK_MARKERS = [
+    "penipuan", "hoaks", "hoax",
+    "disinformasi", "misinformasi",
+    "impostor content", "imposter content",
+    "altered", "fabricated", "false",
+    "salah", "keliru", "sesat",
+    "klarifikasi", "debunk",
+    "fact-check", "fact check", "cek fakta",
+]
+_DEBUNK_LEADING = re.compile(
+    r'^\s*(?:[\[\(\uFF08\u3010\uFF3B\u2772\u27E6]\s*)?(?:'
+    + r'|'.join([re.escape(m) for m in DEBUNK_MARKERS])
+    + r')\s*(?:[\]\)\uFF09\u3011\uFF3D\u2773\u27E7])?\s*[:\-–—]?\s*',
+    flags=re.I,
+)
+_DEBUNK_INLINE = re.compile(
+    r'[\[\(\uFF08\u3010\uFF3B\u2772\u27E6]\s*(?:'
+    + r'|'.join([re.escape(m) for m in DEBUNK_MARKERS])
+    + r')\s*[\]\)\uFF09\u3011\uFF3D\u2773\u27E7]',
+    flags=re.I,
+)
+_DEBUNK_STANDALONE = re.compile(
+    r'\b(?:impostor\s+content|fact[-\s]?check|cek\s*fakta)\b[:\-–—]?',
+    flags=re.I,
+)
+def strip_debunk_labels(s: str) -> str:
+    if not s:
+        return s
+    for _ in range(3):
+        s = _DEBUNK_LEADING.sub("", s)
+    s = _DEBUNK_INLINE.sub(" ", s)
+    s = _DEBUNK_STANDALONE.sub(" ", s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+# --- Deteksi verdict pada halaman cek-fakta ---
+def detect_factcheck_verdict(url: str, raw_title: str, text: str):
+    """
+    Return ('hoax'|'not_hoax'|None, reason) untuk domain cek-fakta.
+    """
+    domain = urlparse(url).netloc.lower()
+    looks_fc = (domain in FACTCHECK_DOMAINS) or re.search(r'cek[-\s]?fakta|fact[-\s]?check|turnbackhoax', url, re.I)
+    if not looks_fc:
+        return None, None
+
+    hay_title = raw_title or ""
+    hay_text = (text or "")[:3000]
+
+    m = FC_HOAX_PAT.search(hay_title) or FC_HOAX_PAT.search(hay_text)
+    if m:
+        return "hoax", f"fact-check verdict: {m.group(0)}"
+
+    m = FC_NOT_HOAX_PAT.search(hay_title) or FC_NOT_HOAX_PAT.search(hay_text)
+    if m:
+        return "not_hoax", f"fact-check verdict: {m.group(0)}"
+
+    return None, None
+
 def extract_article(url: str):
     html_str = fetch_html(url)
     text = trafilatura.extract(
@@ -117,17 +193,22 @@ def extract_article(url: str):
         meta = tf_extract_metadata(html_str)
     except Exception:
         meta = None
-    title = _safe_get(meta, "title")
+    raw_title = _safe_get(meta, "title")
     published = _safe_get(meta, "date")
-    if not title or not published:
+    if not raw_title or not published:
         f_title, f_published = _fallback_meta_from_html(html_str)
-        title = title or f_title
+        raw_title = raw_title or f_title
         published = published or f_published
-    return (text or "")[:MAX_CHARS], title or "", published or ""
+
+    # --- bersihkan label debunk dari judul utk fitur model & potong teks panjang ---
+    clean_title = strip_debunk_labels(raw_title or "")
+    text = (text or "")[:MAX_CHARS]
+    return text, clean_title, published or "", (raw_title or "")
 
 # ---------- Utils: preprocessing ----------
 def normalize_text(s: str) -> str:
     s = html.unescape(s)
+    s = strip_debunk_labels(s)          # bersihkan label debunk di konten
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\u00ad", "")
     s = s.lower()
@@ -147,11 +228,6 @@ def normalize_text(s: str) -> str:
 
 # --- Penentuan hoaks yang bisa dikonfigurasi ---
 def decide_hoax(pred_label, classes=None, proba=None):
-    """
-    Mengembalikan (is_hoax: bool, hoax_prob: Optional[float]).
-    - is_hoax True jika label prediksi termasuk HOAX_LABELS & (prob hoaks >= HOAX_THRESHOLD jika tersedia),
-      atau jika ada kelas hoaks di classes dengan probabilitas >= HOAX_THRESHOLD.
-    """
     pl = str(pred_label).strip().lower()
     hoax_prob = None
     if classes is not None and proba is not None:
@@ -303,6 +379,11 @@ def load_predictor():
 # Muat predictor saat start
 predictor = load_predictor()
 
+# ---------- Helpers kebijakan ----------
+def _resolve_policy(client_policy):
+    p = (client_policy or FACTCHECK_POLICY).strip().lower()
+    return "claim" if p == "claim" else "article"
+
 # ---------- Routes ----------
 @app.route("/health", methods=["GET"])
 def health():
@@ -315,6 +396,8 @@ def health():
         "embed_model": EMBED_MODEL_NAME if predictor.embedder else None,
         "hoax_labels": sorted(list(HOAX_LABELS)),
         "hoax_threshold": HOAX_THRESHOLD,
+        "factcheck_policy_default": FACTCHECK_POLICY,
+        "factcheck_domains": sorted(list(FACTCHECK_DOMAINS))[:10],
     }
     return jsonify(info)
 
@@ -323,6 +406,8 @@ def predict():
     t0 = time.time()
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
+    client_policy = (data.get("policy") or data.get("mode"))
+    policy = _resolve_policy(client_policy)
 
     if not url:
         return jsonify({"error": "Field 'url' wajib diisi."}), 400
@@ -335,7 +420,7 @@ def predict():
         return jsonify({"error": "URL tidak valid."}), 400
 
     try:
-        raw_text, title, published = extract_article(url)
+        raw_text, title, published, raw_title = extract_article(url)
         if not raw_text:
             return jsonify({"error": "Tidak berhasil mengekstrak teks artikel dari URL ini."}), 422
 
@@ -362,16 +447,42 @@ def predict():
                 probabilities = {str(i): float(p) for i, p in enumerate(proba)}
                 confidence = float(max(proba))
 
-        # keputusan hoaks berbasis mapping + threshold
+        # keputusan hoaks berbasis mapping + threshold (model)
         is_hoax, hoax_prob = decide_hoax(pred_label, classes=classes, proba=proba)
 
-        # safety net untuk domain tepercaya
+        # --- FACT-CHECK OVERRIDE (auto-switch) ---
+        verdict, verdict_reason = detect_factcheck_verdict(url, raw_title, raw_text)
+        note_parts = []
+        effective_policy = policy
+
+        # jika cek-fakta menyatakan hoax/keliru/salah dan policy masih "article" → paksa "claim"
+        if verdict == "hoax" and policy == "article":
+            effective_policy = "claim"
+
+        if verdict is not None:
+            if effective_policy == "claim":
+                # Menilai KLAIM: verdict hoax -> tandai hoax (tinggikan prob agar tak diturunkan trusted domains)
+                if verdict == "hoax":
+                    is_hoax = True
+                    hoax_prob = max(hoax_prob or 0.0, 0.95)
+                else:  # "not_hoax"
+                    is_hoax = False
+                    hoax_prob = min(hoax_prob or 1.0, 0.05)
+                note_parts.append(f"{verdict_reason} (policy=claim)")
+            else:
+                # Menilai ARTIKEL cek-fakta: dianggap kredibel
+                is_hoax = False
+                hoax_prob = min(hoax_prob or 1.0, 0.10)
+                note_parts.append(f"{verdict_reason} (policy=article)")
+
+        # safety net untuk domain tepercaya (kecuali sudah dinaikkan tinggi oleh verdict claim)
         domain = urlparse(url).netloc.lower()
-        safety_note = None
         if domain in TRUSTED_DOMAINS and is_hoax:
             if hoax_prob is None or hoax_prob < 0.90:
                 is_hoax = False
-                safety_note = f"Diturunkan karena domain tepercaya ({domain}) dan probabilitas hoaks < 0.90"
+                note_parts.append(f"Diturunkan karena domain tepercaya ({domain}) dan probabilitas hoaks < 0.90")
+
+        safety_note = " | ".join(note_parts) if note_parts else None
 
         payload = {
             "prediction": pred_label,
@@ -381,7 +492,7 @@ def predict():
             "probabilities": probabilities,
             "classes": [str(c) for c in classes] if classes is not None else None,
             "confidence": confidence,  # prob. untuk label yang diprediksi
-            "title": title,
+            "title": title,            # judul yang sudah dibersihkan
             "published": published,
             "source": domain,
             "url": url,
@@ -391,6 +502,9 @@ def predict():
             "preprocessed_words": len(clean_text.split()),
             "latency_ms": int((time.time() - t0) * 1000),
             "note": safety_note,
+            "raw_title": raw_title,       # opsional untuk debug
+            "policy_used": effective_policy,
+            "factcheck_verdict": verdict, # opsional untuk transparansi
         }
         return jsonify(payload)
 
